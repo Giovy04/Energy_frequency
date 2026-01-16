@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frequency-config
+  namespace: frequency
+data:
+  KAFKA_BOOTSTRAP: "localhost:9092"
+  TOPIC_IN: "frequency.telemetry"
+  TOPIC_ALERTS: "frequency.alerts"
+  ES_URL: "http://localhost:9200"
+  ES_INDEX: "frequency-alerts"
+  COOLDOWN_SEC: "120"
+  PYTHONUNBUFFERED: "1"

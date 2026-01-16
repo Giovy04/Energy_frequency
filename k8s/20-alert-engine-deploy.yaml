@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frequency-alert-engine
+  namespace: frequency
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frequency-alert-engine
+  template:
+    metadata:
+      labels:
+        app: frequency-alert-engine
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: frequency-alert-engine
+          image: frequency_alert-engine:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python","alert_engine.py"]
+          envFrom:
+            - configMapRef:
+                name: frequency-config
