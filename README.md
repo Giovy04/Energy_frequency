@@ -1,7 +1,6 @@
 # Energy Frequency
 
-Pipeline di **streaming in tempo reale** per il monitoraggio della frequenza della rete elettrica europea (nominale **50 Hz**). I dati vengono raccolti da una sorgente pubblica, trasportati su Kafka, analizzati con regole, Spark Structured Streaming e un modello di Machine Learning, quindi indicizzati su Elasticsearch e visualizzati con Kibana.
-
+Pipeline di **streaming in tempo reale** per il monitoraggio della frequenza della rete elettrica europea (nominale 50 Hz). I dati vengono raccolti da una sorgente pubblica, trasportati su Kafka, analizzati con regole e con un modello di Machine Learning, quindi indicizzati su Elasticsearch e visualizzati con Kibana.
 
 ## Architettura
 
@@ -14,41 +13,21 @@ Pipeline di **streaming in tempo reale** per il monitoraggio della frequenza del
           ▼
   Kafka: frequency.telemetry
           │
-          ├──► alert_engine.py (k3s) ──► frequency.alerts ──► Elasticsearch
-          │
+          ├──► alert_engine.py (Kubernetes) ──► frequency.alerts ──► Elasticsearch
           ├──► Spark · alerts ────────► frequency.spark-alerts
-          │
           ├──► Spark · parquet ───────► data/telemetry_parquet/ (storico)
-          │
           └──► Spark · ML inference ──► frequency.ml-alerts ──► ml-indexer ──► Elasticsearch
 ```
 
-1. **Ingestione**: Logstash interroga la sorgente `dat.netzfrequenzmessung.de` e pubblica le misure su Kafka.
-2. **Rilevamento anomalie** su tre livelli paralleli:
-   - regole a soglia in Python (`alert_engine.py`);
-   - regole a soglia con Spark Structured Streaming;
-   - classificatore di anomalie addestrato (Spark ML).
-3. **Archiviazione**: gli alert vengono indicizzati su Elasticsearch, la telemetria grezza viene salvata in formato Parquet.
-4. **Visualizzazione**: dashboard Kibana e Kafka UI per l'ispezione dei topic.
-
 ## Tecnologie
 
-| Ambito | Strumenti |
-|---|---|
-| Messaging | Apache Kafka 7.6.1 (Confluent), Zookeeper |
-| Ingestione | Logstash |
-| Stream processing | Apache Spark 3.5.1 (Structured Streaming, MLlib) |
-| Storage e ricerca | Elasticsearch 8.12.2, Parquet |
-| Visualizzazione | Kibana 8.12.2, Kafka UI |
-| Linguaggio | Python 3.11 (`kafka-python`, `elasticsearch`) |
-| Orchestrazione | Docker Compose, Kubernetes |
+Kafka 7.6.1 (Confluent) · Logstash · Spark 3.5.1 (PySpark, Structured Streaming, MLlib) · Elasticsearch / Kibana 8.12.2 · Python 3.11 · Java 17 · docker-compose · Kubernetes
 
 ## Requisiti
 
-- [docker-compose](https://docs.docker.com/compose/install/)
-- [k3s](https://k3s.io/) (Kubernetes leggero) per eseguire `alert_engine.py`
-- Almeno **4 GB di RAM** liberi per lo stack (Kafka, Elasticsearch, Logstash, Spark)
-- Python 3.11+ (solo per provare `alert_engine.py` in locale, senza k3s)
+- docker-compose
+- Un cluster Kubernetes (es. k3s) e `kubectl`, per l'alert engine
+- Almeno 4 GB di RAM liberi
 
 ## Avvio rapido
 
@@ -59,129 +38,124 @@ git clone https://github.com/Giovy04/Energy_frequency.git
 cd Energy_frequency
 ```
 
-**2. Avvia lo stack con docker-compose**
+**2. Avvia lo stack**
 
 ```bash
 docker-compose up -d --build
 ```
 
-I topic Kafka vengono creati automaticamente dal servizio `kafka-init`.
+I topic Kafka vengono creati dal servizio `kafka-init`.
 
-**3. Avvia l'alert engine su k3s**
+**3. Avvia l'alert engine su Kubernetes**
 
 ```bash
-kubectl -n frequency get pods
-kubectl -n frequency get deploy
+kubectl create namespace frequency        # solo la prima volta
+kubectl apply -f k8s/
 kubectl -n frequency scale deploy/frequency-alert-engine --replicas=1
+kubectl -n frequency get pods
 ```
 
 **4. Verifica**
 
-- Apri **Kafka UI** su <http://localhost:8080> per vedere i messaggi nei topic.
-- Apri **Kibana** su <http://localhost:5601> e crea i data view per gli indici `frequency-alerts` e `frequency-ml-alerts`.
+| Servizio | URL |
+|---|---|
+| Kafka UI | <http://localhost:8080> |
+| Kibana | <http://localhost:5601> |
+| Elasticsearch | <http://localhost:9200> |
+
+In Kibana crea i data view per gli indici `frequency-alerts` e `frequency-ml-alerts`.
 
 **5. Arresto**
 
 ```bash
-kubectl -n frequency scale deploy/frequency-alert-engine --replicas=0   # ferma l'alert engine
-docker-compose down                                                     # ferma lo stack, mantiene i volumi
-docker-compose down -v                                                  # ferma lo stack ed elimina anche i dati
+kubectl -n frequency scale deploy/frequency-alert-engine --replicas=0
+docker-compose down        # aggiungi -v per eliminare anche i dati
 ```
 
-> Il servizio `spark-ml-inference` richiede un modello addestrato in `data/models/frequency_anomaly_clf`.
-> <!-- TODO: indicare come generare/addestrare il modello (script e comando) -->
+> Il servizio `spark-ml-inference` richiede un modello in `data/models/frequency_anomaly_clf`.
 
-## Servizi e porte
+## Rilevamento anomalie
 
-| Servizio | Porta | Descrizione |
+Tre rilevatori lavorano in parallelo sul topic `frequency.telemetry`:
+
+| Rilevatore | Topic di output | Logica |
 |---|---|---|
-| Kafka (host) | `9092` | Broker per client esterni |
-| Kafka UI | `8080` | Interfaccia web per i topic |
-| Elasticsearch | `9200` | API REST |
-| Kibana | `5601` | Dashboard |
+| `alert_engine.py` | `frequency.alerts` | Regole Python (tabella sotto) |
+| `spark-alerts` | `frequency.spark-alerts` | Deviazione ≥ `WARN_HZ` (0,02 Hz, severità 2) o ≥ `CRIT_HZ` (0,05 Hz, severità 3) |
+| `spark-ml-inference` | `frequency.ml-alerts` | Random Forest: alert se la misura è classificata anomala, severità 3 se la probabilità è ≥ `PROB_CRIT` (0,85), altrimenti 2 |
 
-## Topic Kafka
+Inoltre `spark-parquet` salva la telemetria in `data/telemetry_parquet/frequency` (partizionata per `event_date`), usata per il training.
 
-| Topic | Contenuto |
-|---|---|
-| `frequency.telemetry` | Misure grezze di frequenza |
-| `frequency.alerts` | Alert generati da `alert_engine.py` |
-| `frequency.spark-alerts` | Alert generati dai job Spark a soglia |
-| `frequency.ml-alerts` | Alert generati dal modello ML |
+**Regole di `alert_engine.py`**
 
-## Logica di alerting
-
-### Regole Python (`alert_engine.py`)
-
-| Tipo di alert | Condizione | Severità |
+| Alert | Condizione | Severità |
 |---|---|---|
-| `FREQ_OUTLIER_HARD` | Frequenza fuori da 45–55 Hz (valore impossibile) | 5 |
-| `FREQ_OUT_OF_BAND` | Frequenza fuori dalla banda 49,90–50,10 Hz | ≥ 3 |
-| `FREQ_DEVIATION_CRIT` | Deviazione dal nominale ≥ 0,05 Hz | 4 |
-| `FREQ_DEVIATION_WARN` | Deviazione dal nominale ≥ 0,02 Hz | 2 |
+| `FREQ_OUTLIER_HARD` | Frequenza fuori da 45–55 Hz | 5 |
+| `FREQ_OUT_OF_BAND` | Frequenza fuori da 49,90–50,10 Hz | ≥ 3 |
+| `FREQ_DEVIATION_CRIT` | Deviazione ≥ 0,05 Hz | 4 |
+| `FREQ_DEVIATION_WARN` | Deviazione ≥ 0,02 Hz | 2 |
 | `STALE_EVENT` | Evento più vecchio di 60 s | 3 |
-| `DATA_MISSING_FIELD` / `DATA_BAD_TYPE` | Campo `frequency_hz` assente o non numerico | 4 |
+| `DATA_MISSING_FIELD` / `DATA_BAD_TYPE` | `frequency_hz` assente o non numerico | 4 |
 
-Per evitare spam, lo stesso alert per la stessa stazione non viene ripetuto prima del periodo di **cooldown** (120 s di default).
+Lo stesso alert per la stessa stazione non viene ripetuto prima del cooldown (120 s).
 
-### Spark e Machine Learning
+## Addestramento del modello ML
 
-- **`spark-alerts`**: soglie di deviazione `WARN_HZ=0.02` e `CRIT_HZ=0.05`.
-- **`spark-ml-inference`**: classificatore con soglie di probabilità `PROB_WARN=0.60` e `PROB_CRIT=0.85`.
-- **`spark-parquet`**: salva la telemetria in `data/telemetry_parquet/frequency` per analisi e training successivi.
+Il modello è un Random Forest (Spark MLlib, 100 alberi) addestrato sullo storico Parquet. Le etichette sono *weak labels* generate da regole: una misura è anomala se la deviazione assoluta è ≥ `WARN_HZ` oppure se `|dt|` è ≥ `DT_ABS_STALE`. Lo script stampa l'AUC sul test set e salva il modello in `MODEL_OUT`.
 
-## Configurazione
+**Prerequisiti**: lo stack deve aver accumulato abbastanza dati, con entrambe le classi (normale e anomala), altrimenti lo script termina con errore.
 
-Tutti i parametri si impostano tramite variabili d'ambiente. Per l'alert engine su k3s vanno definite nella sezione `env` del manifest in `k8s/`.
-
-**`alert_engine.py`**
+```bash
+docker-compose run --rm --no-deps spark-parquet spark-submit /app/train_frequency_mllib.py
+docker-compose restart spark-ml-inference
+```
 
 | Variabile | Default | Descrizione |
 |---|---|---|
-| `KAFKA_BOOTSTRAP` | `localhost:9092` | Indirizzo del broker |
-| `TOPIC_IN` | `frequency.telemetry` | Topic di input |
-| `TOPIC_ALERTS` | `frequency.alerts` | Topic di output |
-| `ES_URL` | `http://localhost:9200` | Endpoint Elasticsearch |
-| `ES_INDEX` | `frequency-alerts` | Indice degli alert |
+| `PARQUET_PATH` | `/data/telemetry_parquet/frequency` | Storico di input |
+| `MODEL_OUT` | `/data/models/frequency_anomaly_clf` | Modello salvato |
+| `WARN_HZ` | `0.02` | Soglia di deviazione per l'etichetta anomala |
+| `DT_ABS_STALE` | `120` | Soglia di `\|dt\|` per l'etichetta anomala |
+| `TEST_FRACTION` | `0.2` | Frazione di test |
+| `SEED` | `42` | Seed |
+
+## Configurazione dell'alert engine
+
+Le variabili sono lette dal ConfigMap `frequency-config` (`k8s/`); quelle assenti usano il default del codice.
+
+| Variabile | Default | Descrizione |
+|---|---|---|
+| `KAFKA_BOOTSTRAP` | `localhost:9092` | Broker Kafka |
+| `TOPIC_IN` / `TOPIC_ALERTS` | `frequency.telemetry` / `frequency.alerts` | Topic di input e output |
+| `ES_URL` / `ES_INDEX` | `http://localhost:9200` / `frequency-alerts` | Elasticsearch |
 | `NOMINAL_HZ` | `50.0` | Frequenza nominale |
-| `FREQ_LOW` / `FREQ_HIGH` | `49.90` / `50.10` | Limiti della banda |
+| `FREQ_LOW` / `FREQ_HIGH` | `49.90` / `50.10` | Banda ammessa |
 | `DEV_WARN` / `DEV_CRIT` | `0.02` / `0.05` | Soglie di deviazione |
 | `HARD_MIN` / `HARD_MAX` | `45.0` / `55.0` | Limiti fisici plausibili |
 | `STALE_SEC` | `60` | Età massima di un evento |
 | `COOLDOWN_SEC` | `120` | Pausa tra alert identici |
 
-**Logstash**: `POLL_INTERVAL` (default `10` secondi) e `GRIDFREQ_URL` (sorgente dati).
-
-## Deploy dell'alert engine su k3s
-
-Lo stack principale gira con docker-compose, mentre `alert_engine.py` viene eseguito come workload su **k3s**, nel namespace `frequency`. I manifest sono nella cartella `k8s/`.
+Dopo una modifica al ConfigMap:
 
 ```bash
-# Stato di pod e deployment
-kubectl -n frequency get pods
-kubectl -n frequency get deploy
-
-# Avvio (1 replica)
-kubectl -n frequency scale deploy/frequency-alert-engine --replicas=1
-
-# Arresto
-kubectl -n frequency scale deploy/frequency-alert-engine --replicas=0
-
-# Log in tempo reale
-kubectl -n frequency logs -f deploy/frequency-alert-engine
+kubectl apply -f k8s/
+kubectl -n frequency rollout restart deploy/frequency-alert-engine
 ```
 
-Il pod deve raggiungere Kafka ed Elasticsearch, che girano sull'host tramite docker-compose. Nel manifest imposta gli endpoint di conseguenza:
+I parametri di Logstash (`POLL_INTERVAL`, `GRIDFREQ_URL`) e dei job Spark sono nel `docker-compose.yml`.
 
-```yaml
-env:
-  - name: KAFKA_BOOTSTRAP
-    value: "<IP_HOST>:9092"
-  - name: ES_URL
-    value: "http://<IP_HOST>:9200"
+## Deploy dell'alert engine su Kubernetes
+
+`alert_engine.py` gira come Deployment `frequency-alert-engine` nel namespace `frequency`. Il pod usa `hostNetwork: true`, quindi raggiunge Kafka ed Elasticsearch (esposti da docker-compose) tramite `localhost`.
+
+```bash
+kubectl -n frequency get pods                                           # stato
+kubectl -n frequency logs -f deploy/frequency-alert-engine              # log
+kubectl -n frequency scale deploy/frequency-alert-engine --replicas=0   # arresto
+kubectl -n frequency scale deploy/frequency-alert-engine --replicas=1   # avvio
 ```
 
-> Kafka pubblicizza il listener esterno come `localhost:9092`, quindi un pod che si collega a `<IP_HOST>:9092` può ricevere dai metadati un indirizzo non raggiungibile. Se succede, esegui il pod con `hostNetwork: true` e usa `localhost` come endpoint.
+**Immagine**: il Deployment usa `frequency_alert-engine:latest` con `imagePullPolicy: IfNotPresent`. L'immagine non è inclusa nel repository e non viene scaricata da un registry: deve essere già presente sul nodo del cluster.
 
 ## Autore
 
